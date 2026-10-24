@@ -70,7 +70,7 @@
   "scripts": {
     "start": "node dist-server/api/[...route].js",
     "fetch:frontend": "node scripts/fetch-frontend.mjs",
-    "build": "node scripts/fetch-frontend.mjs && node scripts/build-edge.mjs",
+    "build": "node scripts/fetch-frontend.mjs && node scripts/inject-retry-patch.mjs && node scripts/build-edge.mjs",
     "build:edge": "node scripts/build-edge.mjs",
     "dev:unified": "node scripts/fetch-frontend.mjs && wrangler dev",
     "dev:worker": "wrangler dev",
