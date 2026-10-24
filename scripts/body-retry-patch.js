@@ -7,10 +7,16 @@
  * 因此客户端重试是安全的（即使对 mkdir/rename/delete 这类写请求也一样）。
  * 官方前端产物本身无重试逻辑，用户会在界面上直接看到报错。本补丁在
  * 构建期以内联 <script> 形式插进 dist/index.html 的 <head> 首位，
- * 在应用 JS 执行前给 fetch 与 XMLHttpRequest（axios 走这条）装上重试：
+ * 在应用 JS 执行前给 fetch 与 XMLHttpRequest 装上重试：
  * 仅当响应恰好是上述 400 时才重试，最多 4 次、300ms 递增退避。
  * 其余响应（包括 "request body required" / "invalid JSON" 这类真客户端
  * 错误）一律原样放行，绝不重试。
+ *
+ * 注意（axios 1.x 关键点）：现代浏览器里 axios 不用 onreadystatechange，
+ * 而是用 request.onloadend 结算；只拦截 onreadystatechange 会导致
+ * onloadend 先把 400 结算给界面、重试结果无人接收。因此 gate 必须同时
+ * 接管 onreadystatechange / onload / onloadend 三个完成信号，且每轮
+ * 尝试只处理第一个信号、最终响应按浏览器顺序一次性放行给原 handler。
  */
 (function () {
   var MARK = "failed to read request body";
@@ -68,11 +74,7 @@
     };
   }
 
-  /* ---- XMLHttpRequest（axios 走这条）----
-   * axios 在 send() 之前就已设置 onreadystatechange，因此在 send() 时
-   * 捕获它并换成 gate：gate 在 readyState 4 时先判断是否为 body 丢失
-   * 400，是则用同一对象重新 open/send（调用方持有的 xhr 引用不变，
-   * 最终响应仍会流向调用方原 handler）；否则原样放行。 */
+  /* ---- XMLHttpRequest（axios 走这条）---- */
   if (typeof XMLHttpRequest !== "undefined") {
     var Proto = XMLHttpRequest.prototype;
     var origOpen = Proto.open;
@@ -112,13 +114,14 @@
       try {
         meta.withCredentials = xhr.withCredentials;
       } catch (e) {}
-      var userHandler = xhr.onreadystatechange;
-      function gate() {
-        if (xhr.readyState !== 4) {
-          if (typeof userHandler === "function")
-            return userHandler.apply(xhr, arguments);
-          return;
-        }
+      // 调用方在 send() 前设置的完成 handler（axios 设 onloadend，
+      // 老浏览器 fallback 设 onreadystatechange；onload 也一并接管）。
+      var userRS = xhr.onreadystatechange;
+      var userLoad = xhr.onload;
+      var userLoadEnd = xhr.onloadend;
+      var handled = false; // 本轮尝试是否已处理完成信号
+      var delivered = false; // 最终响应是否已放行给原 handler
+      function readBodyText() {
         var t = "";
         try {
           t = xhr.responseText || "";
@@ -131,44 +134,84 @@
                 : JSON.stringify(xhr.response);
           } catch (e) {}
         }
+        return t;
+      }
+      function callThrough() {
+        delivered = true;
+        var ev = { target: xhr, currentTarget: xhr };
+        if (typeof userRS === "function") {
+          try {
+            userRS.call(xhr, ev);
+          } catch (e) {}
+        }
+        if (typeof userLoad === "function") {
+          try {
+            userLoad.call(xhr, ev);
+          } catch (e) {}
+        }
+        if (typeof userLoadEnd === "function") {
+          try {
+            userLoadEnd.call(xhr, ev);
+          } catch (e) {}
+        }
+      }
+      function resend() {
+        handled = false;
+        delivered = false;
+        origOpen.call(
+          xhr,
+          meta.method,
+          meta.url,
+          meta.async !== false,
+          meta.user,
+          meta.password,
+        );
+        for (var k in meta.headers) {
+          try {
+            origSetHeader.call(xhr, k, meta.headers[k]);
+          } catch (e) {}
+        }
+        try {
+          xhr.responseType = meta.responseType;
+        } catch (e) {}
+        try {
+          xhr.timeout = meta.timeout;
+        } catch (e) {}
+        try {
+          xhr.withCredentials = meta.withCredentials;
+        } catch (e) {}
+        xhr.onreadystatechange = gate;
+        xhr.onload = gate;
+        xhr.onloadend = gate;
+        origSend.call(xhr, meta.body);
+      }
+      function gate() {
+        if (delivered) return; // 最终响应已放行，浏览器后续的真实事件不再重复放行
+        if (xhr.readyState !== 4) {
+          // 非完成信号（readystatechange 1/2/3）：只放行 onreadystatechange
+          if (typeof userRS === "function") {
+            try {
+              userRS.call(xhr, { target: xhr, currentTarget: xhr });
+            } catch (e) {}
+          }
+          return;
+        }
+        if (handled) return; // 同一轮尝试的后续完成信号（load/loadend）不再重复处理
+        handled = true;
         if (
           meta.attempts < MAX_RETRIES &&
           isApi(meta.url) &&
-          isBodyLost(xhr.status, t)
+          isBodyLost(xhr.status, readBodyText())
         ) {
           meta.attempts++;
-          setTimeout(function () {
-            origOpen.call(
-              xhr,
-              meta.method,
-              meta.url,
-              meta.async !== false,
-              meta.user,
-              meta.password,
-            );
-            for (var k in meta.headers) {
-              try {
-                origSetHeader.call(xhr, k, meta.headers[k]);
-              } catch (e) {}
-            }
-            try {
-              xhr.responseType = meta.responseType;
-            } catch (e) {}
-            try {
-              xhr.timeout = meta.timeout;
-            } catch (e) {}
-            try {
-              xhr.withCredentials = meta.withCredentials;
-            } catch (e) {}
-            xhr.onreadystatechange = gate;
-            origSend.call(xhr, meta.body);
-          }, 300 * meta.attempts);
+          setTimeout(resend, 300 * meta.attempts);
           return;
         }
-        if (typeof userHandler === "function")
-          return userHandler.apply(xhr, arguments);
+        callThrough();
       }
       xhr.onreadystatechange = gate;
+      xhr.onload = gate;
+      xhr.onloadend = gate;
       return origSend.apply(xhr, arguments);
     };
   }
